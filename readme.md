@@ -3,6 +3,24 @@
 Repairs a Cassandra cluster using read repairs. Supports the same options as
 nodetool repair where possible.
 
+# Incremental read repair support
+This is a basic experimental branch that supports running incremental read repair via the reading at CL.ALL. It requires running Cassandra from the following branch https://github.com/benbromhead/cassandra/tree/support-live-mark-repaired.
+
+Currently it only runs on the local Cassandra node where it can access JMX via localhost:7199
+
+Run instarepair with the following JVM options:
+```
+-Dcassandra.config=file:///~/cassandra/conf/cassandra.yaml
+-Dcassandra.storagedir=~/cassandra/data
+-Dlogback.configurationFile=file:///~/cassandra/conf/logback.xml
+-Dcassandra.logdir=~/cassandra/data/logs
+-Djava.library.path=~/cassandra/lib/sigar-bin
+-ea
+```
+
+You will also want to specify the keyspace and the table:
+`instarepair keyspace table`
+
 # Usage
 
 ic-repair <options> [<keyspace> <tables>...]
@@ -23,24 +41,6 @@ Option                             | Description
 -t,--threads threads>              | Maximum number parallel repairs. Defaults to number of available processors.
 -r,--retry <max\_retry>            | Maximum number of retries when there are unavailable nodes.
 -d,--retry-delay <delay\_ms>       | Base delay between retries when nodes are unavailable.
-
-# Incremental read repair support
-This is a basic experimental branch that supports running incremental read repair via the reading at CL.ALL. It requires running Cassandra from the following branch https://github.com/benbromhead/cassandra/tree/support-live-mark-repaired.
-
-Currently it only runs on the local Cassandra node where it can access JMX via localhost:7199
-
-Run instarepair with the following JVM options:
-```
--Dcassandra.config=file:///~/cassandra/conf/cassandra.yaml
--Dcassandra.storagedir=~/cassandra/data
--Dlogback.configurationFile=file:///~/cassandra/conf/logback.xml
--Dcassandra.logdir=~/cassandra/data/logs
--Djava.library.path=~/cassandra/lib/sigar-bin
--ea
-```
-
-You will also want to specify the keyspace and the table:
-`instarepair keyspace table`
 
 # SSL
 
