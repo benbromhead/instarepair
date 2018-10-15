@@ -34,6 +34,14 @@
             <artifactId>logback-classic</artifactId>
             <version>1.1.7</version>
         </dependency>
+
+        <!-- https://mvnrepository.com/artifact/org.apache.cassandra/cassandra-all -->
+        <dependency>
+            <groupId>org.apache.cassandra</groupId>
+            <artifactId>cassandra-all</artifactId>
+            <version>3.11.3</version>
+        </dependency>
+
     </dependencies>
     <build>
         <pluginManagement>

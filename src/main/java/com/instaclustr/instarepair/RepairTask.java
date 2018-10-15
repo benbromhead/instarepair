@@ -2,21 +2,57 @@ package com.instaclustr.instarepair;
 
 import com.datastax.driver.core.*;
 import com.datastax.driver.core.querybuilder.QueryBuilder;
+import com.google.common.collect.ArrayListMultimap;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.Multimap;
+import com.google.common.collect.TreeMultimap;
 import com.google.common.util.concurrent.Futures;
+import com.sun.source.tree.Tree;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.ColumnFamilyStoreMBean;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.db.compaction.CompactionManagerMBean;
+import org.apache.cassandra.db.rows.BaseRowIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.KeyIterator;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.tools.JsonTransformer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.management.JMX;
+import javax.management.MalformedObjectNameException;
+import javax.management.ObjectName;
+import javax.management.remote.JMXConnector;
+import javax.management.remote.JMXConnectorFactory;
+import javax.management.remote.JMXServiceURL;
+import javax.rmi.ssl.SslRMIClientSocketFactory;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.RuntimeMXBean;
+import java.nio.ByteBuffer;
+import java.rmi.server.RMIClientSocketFactory;
+import java.rmi.server.RMISocketFactory;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 
 import static com.datastax.driver.core.querybuilder.QueryBuilder.*;
 import static com.datastax.driver.core.querybuilder.QueryBuilder.bindMarker;
+import static org.apache.cassandra.tools.SSTableExport.metadataFromSSTable;
 
 /**
  * Coordinator for read repairing a node.
@@ -113,6 +149,11 @@ public class RepairTask implements Callable<Boolean> {
      * Cache of PreparedStatement for table.
      */
     private HashMap<TableMetadata, PreparedStatement> statementCache = new HashMap<>();
+
+
+
+
+    private boolean incremental = true;
 
     /**
      * @param maxRetryAttempts       Maximum number of retries when there are unavailable nodes.
@@ -325,27 +366,94 @@ public class RepairTask implements Callable<Boolean> {
         return ranges;
     }
 
+
+    private static <T> Stream<T> iterToStream(Iterator<T> iter)
+    {
+        Spliterator<T> splititer = Spliterators.spliteratorUnknownSize(iter, Spliterator.IMMUTABLE);
+        return StreamSupport.stream(splititer, false);
+    }
+
+
     /**
      * Get the token ranges to repair for the host.
      *
      * @return Token ranges owned by host for this keyspace.
      */
-    private List<TokenRange> getTokenRanges() {
-        Stream<TokenRange> ranges = metadata.getTokenRanges(keyspace.getName(), host).stream();
+    private Multimap<String, TokenRange> getTokenRanges(final String keyspace, final String table) {
+        Multimap<String, TokenRange> ranges = ArrayListMultimap.create();
+
+//        List<TokenRange> ranges = new ArrayList<>();
+
+        if(incremental) {
+            List<String> unrepairedSStables = new ArrayList<>();
+            try {
+                JMXClient client = new JMXClient("localhost", 7199);
+                Iterator<Map.Entry<String, ColumnFamilyStoreMBean>> mbeans = client.getColumnFamilyStoreMBeanProxies();
+
+                while(mbeans.hasNext()) {
+                    Map.Entry<String, ColumnFamilyStoreMBean> entry = mbeans.next(); //TODO: filter excluded tables
+
+                    if (keyspace.equals(entry.getKey()) && table.equals(entry.getValue().getTableName())) {
+                        unrepairedSStables.addAll(entry.getValue().getUnrepairedSSTables());
+                    }
+
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+
+
+            for(String sstableFileName: unrepairedSStables) {
+                try {
+                    Descriptor desc = Descriptor.fromFilename(sstableFileName);
+                    CFMetaData cfmetadata = metadataFromSSTable(desc);
+                    SSTableReader sstable = SSTableReader.openNoValidation(desc, cfmetadata);
+                    IPartitioner partitioner = sstable.getPartitioner();
+                    final ISSTableScanner currentScanner = sstable.getScanner();
+
+                    Stream<UnfilteredRowIterator> partitions = iterToStream(currentScanner);
+
+
+                    ranges.putAll(sstableFileName, partitions.map(BaseRowIterator::partitionKey).map(DecoratedKey::getToken).map(t -> {
+                        long token = (long) t.getTokenValue();
+                        return metadata.newTokenRange(metadata.newToken(String.valueOf(token - 1)), metadata.newToken(String.valueOf(token)));
+                    }).collect(Collectors.toList()));
+
+                    currentScanner.close();
+                } catch (IOException e) {
+                    logger.warn("Could not open sstable {}", sstableFileName);
+                }
+            }
+        } else {
+            //TODO fix the non-incremental version of this
+            ranges.putAll("", metadata.getTokenRanges(keyspace, host));
+        }
+
+
         if (primaryOnly) {
-            ranges = ranges.filter(range -> host.getTokens().contains(range.getEnd()));
+            //TODO: fix
+//            ranges = ranges.stream().filter(range -> host.getTokens().contains(range.getEnd())).collect(Collectors.toList());
         }
-        List<TokenRange> nodeRanges = ranges.collect(Collectors.toList());
-        Collection<Iterable<TokenRange>> stepRanges = new ArrayList<>(nodeRanges.size());
-        for (TokenRange nodeRange : nodeRanges) {
-            stepRanges.add(Util.split(metadata, nodeRange, steps));
-        }
-        RoundRobinIterator<TokenRange> iterator = new RoundRobinIterator<>(stepRanges);
-        List<TokenRange> tokenRanges = new ArrayList<>(nodeRanges.size() * steps);
-        while (iterator.hasNext()) {
-            tokenRanges.add(iterator.next());
-        }
-        return tokenRanges;
+
+
+//        List<TokenRange> nodeRanges = ranges;
+//        Collection<Iterable<TokenRange>> stepRanges = new ArrayList<>(nodeRanges.size());
+//        for (TokenRange nodeRange : nodeRanges) {
+//            stepRanges.add(Util.split(metadata, nodeRange, steps));
+//        }
+
+//
+//
+//        RoundRobinIterator<TokenRange> iterator = new RoundRobinIterator<>(stepRanges);
+//        List<TokenRange> tokenRanges = new ArrayList<>(nodeRanges.size() * steps);
+//        while (iterator.hasNext()) {
+//            tokenRanges.add(iterator.next());
+//        }
+
+
+//        return tokenRanges;
+        return ranges;
+
     }
 
     @Override
@@ -420,14 +528,36 @@ public class RepairTask implements Callable<Boolean> {
      * @return true if all tables were repaired.
      */
     private boolean repairTables() {
-        List<TokenRange> keyspaceTokenRanges = getTokenRanges();
 
         boolean isRepaired = true;
 
         while (coordinator.isRunning() && (table = tables.poll()) != null) {
+
             logger.info("Repairing {}.{}", table.getKeyspace().getName(), table.getName());
-            tableRanges = newTokenRangeQueue(keyspaceTokenRanges);
-            isRepaired = repairTable(table, tableRanges) && isRepaired;
+            Multimap<String, TokenRange> keyspaceTokenRanges = getTokenRanges(table.getKeyspace().getName(), table.getName());
+
+            for(String ssTableName : keyspaceTokenRanges.keySet()) {
+                tableRanges = newTokenRangeQueue(keyspaceTokenRanges.get(ssTableName));
+                boolean isTableRepaired = repairTable(table, tableRanges);
+
+                if (isTableRepaired) {
+                    try {
+                        JMXClient client = new JMXClient("localhost", 7199);
+
+
+                        CompactionManagerMBean mbeans = client.getCompactionManagerProxy();
+
+                        mbeans.forceUserDefinedMarkRepaired(ssTableName);
+
+                    } catch (IOException e) {
+                        logger.warn("Could not mark SSTable {} as repaired", ssTableName, e);
+                        isRepaired = false; // Re-repair on next attempt
+                    }
+                }
+
+                isRepaired = isTableRepaired && isRepaired;
+            }
+
         }
 
         return coordinator.isRunning() && isRepaired;
@@ -526,7 +656,7 @@ public class RepairTask implements Callable<Boolean> {
             String[] partitionColumns = table.getPartitionKey().stream().map(ColumnMetadata::getName).toArray(String[]::new);
             String tokenKeys = token(partitionColumns);
             columns.add(tokenKeys);
-            table.getColumns().stream().map(ColumnMetadata::getName).forEachOrdered(columns::add);
+            table.getColumns().stream().map(x -> "\"" + x.getName() + "\"").forEachOrdered(columns::add);
             PreparedStatement statement = session.prepare(QueryBuilder.select(columns.toArray(new String[columns.size()]))
                     .from(table).where(gt(tokenKeys, bindMarker())).and(lte(tokenKeys, bindMarker())));
             statementCache.put(table, statement);
